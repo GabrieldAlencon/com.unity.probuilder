@@ -12,6 +12,8 @@ namespace UnityEngine.ProBuilder
     /// </summary>
     public static class HandleUtility
     {
+        // Cache do vetor "up" (bitangente) por face para manter continuidade e evitar flips de 180°.
+        static Dictionary<int, Dictionary<int, Vector3>> s_LastFaceUp = new Dictionary<int, Dictionary<int, Vector3>>();
         /// <summary>
         /// Convert a screen point (0,0 bottom left, in pixels) to a GUI point (0,0 top left, in points).
         /// </summary>
@@ -461,14 +463,186 @@ namespace UnityEngine.ProBuilder
             if (face == null)
                 return mesh.transform.rotation;
 
-            // Intentionally not using coincident vertices here. We want the normal of just the face, not an
-            // average of it's neighbors.
-            Normal nrm = Math.NormalTangentBitangent(mesh, face);
-
-            if (nrm.normal == Vector3.zero || nrm.bitangent == Vector3.zero)
+            // Usar uma base geométrica estável (normal + tangente por aresta) para evitar inversões de 180°.
+            Vector3 normal = Math.Normal(mesh, face);
+            if (normal == Vector3.zero)
                 return mesh.transform.rotation;
 
-            return mesh.transform.rotation * Quaternion.LookRotation(nrm.normal, nrm.bitangent);
+            var positions = mesh.positionsInternal;
+            var distinct = face.distinctIndexes;
+            // Calcular a direção principal do plano da face via PCA (covariância 2D),
+            // tornando o eixo "tangent" alinhado com o maior alongamento da geometria da face.
+            Vector3 tangent = Vector3.zero;
+            Vector3 bitangent = Vector3.zero;
+            if (distinct != null && distinct.Count >= 2)
+            {
+                // Base no plano: u e v ortogonais, ambos ortogonais a normal
+                Vector3 u = Vector3.ProjectOnPlane(Vector3.right, normal);
+                if (u.sqrMagnitude < 1e-6f)
+                    u = Vector3.ProjectOnPlane(Vector3.up, normal);
+                if (u.sqrMagnitude < 1e-6f)
+                    u = Vector3.ProjectOnPlane(Vector3.forward, normal);
+                u.Normalize();
+                Vector3 v = Vector3.Cross(normal, u).normalized;
+
+                // Centróide
+                Vector3 centroid = Vector3.zero;
+                for (int i = 0; i < distinct.Count; i++)
+                    centroid += positions[distinct[i]];
+                centroid /= distinct.Count;
+
+                // Coordenadas 2D centradas
+                float sumX = 0f, sumY = 0f;
+                var xs = new float[distinct.Count];
+                var ys = new float[distinct.Count];
+                for (int i = 0; i < distinct.Count; i++)
+                {
+                    Vector3 r = positions[distinct[i]] - centroid;
+                    // projeta no plano
+                    Vector3 rproj = r - Vector3.Dot(r, normal) * normal;
+                    float x = Vector3.Dot(rproj, u);
+                    float y = Vector3.Dot(rproj, v);
+                    xs[i] = x; ys[i] = y;
+                    sumX += x; sumY += y;
+                }
+                float meanX = sumX / distinct.Count;
+                float meanY = sumY / distinct.Count;
+
+                float a = 0f, b = 0f, c = 0f; // [[a, b], [b, c]]
+                for (int i = 0; i < distinct.Count; i++)
+                {
+                    float dx = xs[i] - meanX;
+                    float dy = ys[i] - meanY;
+                    a += dx * dx;
+                    b += dx * dy;
+                    c += dy * dy;
+                }
+                a /= distinct.Count; b /= distinct.Count; c /= distinct.Count;
+
+                // Maior autovalor
+                float trace = a + c;
+                float det = a * c - b * b;
+                float disc = trace * trace - 4f * det;
+                float sqrtDisc = Mathf.Sqrt(Mathf.Max(0f, disc));
+                float lambda = 0.5f * (trace + sqrtDisc);
+
+                float px, py;
+                if (Mathf.Abs(b) > 1e-8f)
+                {
+                    px = lambda - c; py = b;
+                }
+                else
+                {
+                    if (a >= c) { px = 1f; py = 0f; }
+                    else { px = 0f; py = 1f; }
+                }
+
+                Vector3 principal = (px * u + py * v);
+                if (principal.sqrMagnitude > 1e-12f)
+                    tangent = principal.normalized;
+            }
+
+            // Se PCA falhar, recorre ao método baseado em UVs
+            if (tangent == Vector3.zero)
+            {
+                Normal nrm = Math.NormalTangentBitangent(mesh, face);
+                if (nrm.normal != Vector3.zero && nrm.bitangent != Vector3.zero)
+                {
+                    normal = nrm.normal;
+                    bitangent = nrm.bitangent.normalized;
+                }
+                else
+                {
+                    // fallback mínimo: escolha um eixo arbitrário no plano
+                    Vector3 refAxis = Mathf.Abs(Vector3.Dot(normal.normalized, Vector3.right)) < 0.9f ? Vector3.right : Vector3.forward;
+                    tangent = Vector3.ProjectOnPlane(refAxis, normal).normalized;
+                    bitangent = Vector3.Cross(normal, tangent).normalized;
+                }
+            }
+
+            // Se tangente definida por PCA, obter bitangente coerente
+            if (tangent != Vector3.zero)
+                bitangent = Vector3.Cross(normal, tangent).normalized;
+
+            // Garantir que bitangent esteja válido; se ainda for zero, crie um fallback seguro
+            if (bitangent.sqrMagnitude < 1e-12f)
+            {
+                Vector3 refAxis = Mathf.Abs(Vector3.Dot(normal.normalized, Vector3.right)) < 0.9f ? Vector3.right : Vector3.forward;
+                Vector3 safeTangent = Vector3.ProjectOnPlane(refAxis, normal).normalized;
+                bitangent = Vector3.Cross(normal, safeTangent).normalized;
+                if (tangent == Vector3.zero)
+                    tangent = safeTangent;
+            }
+
+            // Bloquear flip de sinal mantendo continuidade do "up" por face.
+            int meshIdLock = mesh.GetInstanceID();
+            int faceIndexLock = Array.IndexOf(mesh.facesInternal, face);
+            if (faceIndexLock >= 0)
+            {
+                if (!s_LastFaceUp.TryGetValue(meshIdLock, out var dict))
+                {
+                    dict = new Dictionary<int, Vector3>();
+                    s_LastFaceUp[meshIdLock] = dict;
+                }
+                if (dict.TryGetValue(faceIndexLock, out var lastUp))
+                {
+                    if (Vector3.Dot(bitangent, lastUp) < 0f)
+                    {
+                        bitangent = -bitangent;
+                        tangent = Vector3.Cross(normal, bitangent).normalized;
+                    }
+                }
+                dict[faceIndexLock] = bitangent;
+            }
+
+            // Tie-breaker determinístico: alinhar sinal do up com projeção do world up no plano da face.
+            // Evita flips quando não há histórico (ex.: primeira seleção após operações).
+            Vector3 worldUpLocal = mesh.transform.InverseTransformDirection(Vector3.up);
+            Vector3 refUpPlane = Vector3.ProjectOnPlane(worldUpLocal, normal);
+            if (refUpPlane.sqrMagnitude > 1e-6f)
+            {
+                refUpPlane.Normalize();
+                if (Vector3.Dot(bitangent, refUpPlane) < 0f)
+                {
+                    bitangent = -bitangent;
+                    tangent = Vector3.Cross(normal, bitangent).normalized;
+                }
+            }
+
+            // Orientação em espaço de mundo usando TransformDirection
+            // Corrigir normal em escala não uniforme: usar inverse-transpose do localToWorld
+            Matrix4x4 l2w = mesh.transform.localToWorldMatrix;
+            Matrix4x4 invTrans = l2w.inverse.transpose;
+            Vector3 worldNormal = invTrans.MultiplyVector(normal).normalized;
+
+            // Transformar up/tangent para mundo e projetar no plano da face para ortogonalidade
+            Vector3 worldUpRaw = l2w.MultiplyVector(bitangent);
+            Vector3 worldUp = Vector3.ProjectOnPlane(worldUpRaw, worldNormal);
+            if (worldUp.sqrMagnitude < 1e-6f)
+            {
+                // Fallback quando up quase paralelo à normal após transformações
+                Vector3 fallback = Mathf.Abs(Vector3.Dot(worldNormal, Vector3.up)) > 0.99f ? Vector3.right : Vector3.up;
+                worldUp = Vector3.ProjectOnPlane(fallback, worldNormal);
+            }
+            worldUp.Normalize();
+
+            Vector3 worldTangent = Vector3.Cross(worldNormal, worldUp).normalized;
+            // Reconstituir up para garantir base ortonormal direita
+            worldUp = Vector3.Cross(worldTangent, worldNormal).normalized;
+
+            // Tie-breaker adicional em espaço de mundo para consistência com world up
+            Vector3 refUpPlaneW = Vector3.ProjectOnPlane(Vector3.up, worldNormal);
+            if (refUpPlaneW.sqrMagnitude > 1e-6f)
+            {
+                refUpPlaneW.Normalize();
+                if (Vector3.Dot(worldUp, refUpPlaneW) < 0f)
+                {
+                    worldUp = -worldUp;
+                    worldTangent = -worldTangent;
+                }
+            }
+
+            return Quaternion.LookRotation(worldNormal, worldUp);
         }
 
         /// <summary>
@@ -512,7 +686,123 @@ namespace UnityEngine.ProBuilder
             if (mesh == null)
                 return Quaternion.identity;
 
-            return GetFaceRotation(mesh, EdgeUtility.GetFace(mesh, edge));
+            var positions = mesh.positionsInternal;
+            if (edge.a < 0 || edge.b < 0 || edge.a >= positions.Length || edge.b >= positions.Length)
+                return mesh.transform.rotation;
+
+            // Eixo X: direção da aresta em espaço de mundo
+            Vector3 localEdge = positions[edge.b] - positions[edge.a];
+            if (localEdge.sqrMagnitude < 1e-12f)
+                return mesh.transform.rotation;
+
+            Vector3 worldX = mesh.transform.TransformDirection(localEdge).normalized;
+
+            // Transformação inversa-transposta para normals com escala não uniforme
+            Matrix4x4 invTrans = Matrix4x4.Transpose(Matrix4x4.Inverse(mesh.transform.localToWorldMatrix));
+
+            // Somatório dos vetores de plano por face adjacente: Ui = cross(X, Ni_world)
+            Vector3 sumUp = Vector3.zero;
+            var faces = mesh.facesInternal;
+            int foundAdjFaces = 0;
+            Vector3 sumNormalsWorld = Vector3.zero; // para definir "fora" pela média das normais
+            // Posições dos vértices da aresta (lidas uma vez)
+            Vector3 aPos = positions[edge.a];
+            Vector3 bPos = positions[edge.b];
+            const float eps = 1e-5f; // tolerância para coincidência de posição
+            for (int i = 0; i < faces.Length; ++i)
+            {
+                var f = faces[i];
+                // Em muitas malhas ProBuilder, faces adjacentes usam índices distintos para o mesmo vértice coincidente.
+                // Então detectamos adjacência por posição, não apenas por índices crus.
+                var faceIdx = f.indexesInternal;
+                bool hasA = false, hasB = false;
+                if (faceIdx != null && faceIdx.Length > 0)
+                {
+                    for (int k = 0; k < faceIdx.Length; ++k)
+                    {
+                        Vector3 p = positions[faceIdx[k]];
+                        if (!hasA && (p - aPos).sqrMagnitude <= eps * eps) hasA = true;
+                        if (!hasB && (p - bPos).sqrMagnitude <= eps * eps) hasB = true;
+                        if (hasA && hasB) break;
+                    }
+                }
+
+                if (!hasA || !hasB)
+                {
+                    // Como fallback, verificar índices distintos internos se disponível
+                    var distinct = f.distinctIndexesInternal;
+                    if (distinct != null && distinct.Length > 0)
+                    {
+                        for (int k = 0; k < distinct.Length && !(hasA && hasB); ++k)
+                        {
+                            Vector3 p = positions[distinct[k]];
+                            if (!hasA && (p - aPos).sqrMagnitude <= eps * eps) hasA = true;
+                            if (!hasB && (p - bPos).sqrMagnitude <= eps * eps) hasB = true;
+                        }
+                    }
+                }
+
+                if (!hasA || !hasB)
+                    continue; // face não adjacente à aresta
+
+                Vector3 nLocal = Math.Normal(mesh, f);
+                if (nLocal.sqrMagnitude < 1e-12f)
+                    continue;
+
+                Vector3 nWorld = invTrans.MultiplyVector(nLocal).normalized;
+                sumNormalsWorld += nWorld;
+                Vector3 ui = Vector3.Cross(worldX, nWorld);
+                // Acumular ponderado pela magnitude (sin do ângulo entre X e N)
+                sumUp += ui;
+                foundAdjFaces++;
+                if (foundAdjFaces >= 2)
+                    break; // apenas duas faces devem ser adjacentes a uma aresta em malhas manifold
+            }
+
+            // Se o somatório for muito pequeno, usar fallback estável com world up projetado
+            Vector3 worldUp;
+            if (sumUp.sqrMagnitude < 1e-6f)
+            {
+                Vector3 fallbackUp = Vector3.ProjectOnPlane(Vector3.up, worldX);
+                if (fallbackUp.sqrMagnitude < 1e-6f)
+                    fallbackUp = Vector3.ProjectOnPlane(Vector3.right, worldX);
+                worldUp = fallbackUp.normalized;
+            }
+            else
+            {
+                worldUp = sumUp.normalized;
+            }
+
+            // Z é perpendicular ao plano definido por X e Y (bissetor)
+            Vector3 worldZ = Vector3.Cross(worldX, worldUp).normalized;
+            worldUp = Vector3.Cross(worldZ, worldX).normalized; // ortonormalizar Y e garantir base dextra
+
+            // Desempate determinístico com world up
+            Vector3 refUp = Vector3.ProjectOnPlane(Vector3.up, worldX);
+            if (refUp.sqrMagnitude > 1e-6f)
+            {
+                refUp.Normalize();
+                if (Vector3.Dot(worldUp, refUp) < 0f)
+                {
+                    worldUp = -worldUp;
+                    worldZ = -worldZ;
+                }
+            }
+
+            // Garantir que +Y aponte para fora (média das normais das faces adjacentes)
+            if (sumNormalsWorld.sqrMagnitude > 1e-6f)
+            {
+                Vector3 outward = sumNormalsWorld.normalized;
+                // Y é worldZ (LookRotation(forward=worldUp, up=worldZ)). Se estiver apontando para dentro, inverta Y (e forward para preservar X).
+                if (Vector3.Dot(worldZ, outward) < 0f)
+                {
+                    worldZ = -worldZ;
+                    worldUp = -worldUp;
+                }
+            }
+
+            // Mapeamento de eixos: Y (up) deve ser o normal/bissetor e Z (forward) o lateral
+            return Quaternion.LookRotation(worldUp, worldZ);
         }
 
         /// <summary>

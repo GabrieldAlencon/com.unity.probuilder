@@ -115,7 +115,10 @@ namespace UnityEditor.ProBuilder
         // Sync ProBuilder HandleOrientation to the current Tools.PivotRotation
         static void SyncPivotRotation()
         {
-            if (s_PivotRotation != Tools.pivotRotation)
+            // Quando o modo atual é ActiveElement, não sincronizar a orientação com Tools.pivotRotation.
+            // Isso evita que após operações (ex.: terminar uma rotação) o Unity mude o PivotRotation
+            // e force a orientação a voltar para Local/Global, causando o "flip" percebido.
+            if (s_HandleOrientation.value != HandleOrientation.ActiveElement && s_PivotRotation != Tools.pivotRotation)
             {
                 s_HandleOrientation.SetValue(Tools.pivotRotation == PivotRotation.Global
                     ? HandleOrientation.World

@@ -158,7 +158,7 @@ namespace UnityEditor.ProBuilder
 
             if (o != null)
             {
-                string path = AssetDatabase.GetAssetPath(o.GetObjectId());
+                string path = AssetDatabase.GetAssetPath(o.GetInstanceID());
 
                 if (!string.IsNullOrEmpty(path))
                 {
